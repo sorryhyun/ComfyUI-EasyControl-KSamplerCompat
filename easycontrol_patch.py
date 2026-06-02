@@ -322,8 +322,19 @@ def _make_self_attn_forward(state: EasyControlState, idx: int):
     Resolves the live ``Attention`` from ``state.live_blocks[idx].self_attn``
     each call, so a downstream DiT rebuild can't strand the patch on a dead
     instance.
+
+    ``torch._dynamo.disable`` keeps this an opaque eager region so the closure
+    composes with per-block ``torch.compile`` (e.g. the Anima Block Compile
+    node). Without it, dynamo tries to trace the ``state.live_blocks[idx]``
+    deref while compiling that very block and re-enters the module tree from a
+    non-local source, tripping ``"UnspecializedNNModuleVariable(Block) is
+    already tracked for mutation"``. The same live-block indirection that makes
+    this patch survive a DiT rebuild is what dynamo can't reconcile, so we just
+    graph-break around the extended attention (the rest of the block still
+    compiles).
     """
 
+    @torch._dynamo.disable
     def forward(x, context=None, rope_emb=None, transformer_options={}):
         attn = state.live_blocks[idx].self_attn
         cache = state.cond_kv_cache
