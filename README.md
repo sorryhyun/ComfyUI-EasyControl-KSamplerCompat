@@ -3,10 +3,14 @@
 KSampler-compatible **Anima EasyControl** image conditioning for ComfyUI.
 
 One node — **`Anima EasyControl (KSampler)`** — takes `MODEL + VAE + IMAGE` and
-returns a `MODEL`. The reference-image conditioning rides on the returned model
-as a set of ModelPatcher object-patches, so it flows straight into the **stock
-KSampler** and composes with the rest of your graph (schedulers, ControlNet,
-other adapters).
+returns a `MODEL` plus an empty `LATENT` sized to the conditioning resolution.
+The reference-image conditioning rides on the returned model as a set of
+ModelPatcher object-patches, so it flows straight into the **stock KSampler** and
+composes with the rest of your graph (schedulers, ControlNet, other adapters).
+Wire the `LATENT` output into the KSampler's `latent_image` and the generation
+matches the (aspect-preserved, ~1MP) cond grid automatically — no manual
+`EmptyLatentImage` sizing, and the two streams share a grid for clean spatial
+alignment on tasks like colorization.
 
 This is deliberately unlike the upstream Flux / Qwen EasyControl ComfyUI nodes,
 which make you load a model through a dedicated loader and sample with a
@@ -33,19 +37,25 @@ colorizes the reference while respecting its structure.
 ## Wiring
 
 ```
-UNETLoader ──► MODEL ─┐
-                      ├─► Anima EasyControl (KSampler) ──► MODEL ──► KSampler ──► ...
-VAELoader ───► VAE ───┤
-LoadImage ──► IMAGE ──┘                    ▲
-                                  easycontrol_lora = <your ckpt>
-                                  strength = 1.0
+UNETLoader ──► MODEL ─┐                          MODEL ──► KSampler ──► ...
+                      ├─► Anima EasyControl ────┤            ▲
+VAELoader ───► VAE ───┤        (KSampler)        └─ LATENT ──┘
+LoadImage ──► IMAGE ──┘            ▲
+                          easycontrol_lora = <your ckpt>
+                          strength = 1.0, target_megapixels = 1.0
 ```
 
 - **`image`** — the conditioning image (the grayscale / lineart page for
-  colorization). It is VAE-encoded once; resolution should match what you
-  sample at (the cond stream runs at the image's own token count).
+  colorization). It is resized to `target_megapixels` (aspect-preserving,
+  VAE/patch-snapped) and VAE-encoded once; the returned `LATENT` is sized to that
+  same grid, so the cond stream and the sampled target share a resolution.
 - **`strength`** — scales the trained cond effect. `1.0` = as trained. Raise to
   push harder toward the reference, lower to loosen.
+- **`target_megapixels`** (optional) — output size in megapixels for the returned
+  latent and the cond encode. `1.0` (default) keeps generation on the ~1MP
+  distribution Anima was trained at; `0` keeps the input's native resolution
+  (still snapped to the VAE/patch grid). Feed the `LATENT` output into the
+  KSampler's `latent_image`.
 - **`cond_scale_override`** (optional) — replace the checkpoint's trained
   `cond_scale` outright (before `strength`); `0` = keep the trained value.
 
