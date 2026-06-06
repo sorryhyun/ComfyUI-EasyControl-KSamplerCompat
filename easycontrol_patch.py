@@ -52,7 +52,35 @@ logger = logging.getLogger(__name__)
 
 # ComfyUI backbone helpers. Imported at module load — this node only makes sense
 # inside a ComfyUI install, where these are always importable.
-from comfy.ldm.cosmos.predict2 import apply_rotary_pos_emb
+#
+# Cosmos/Anima rope application. ComfyUI shipped the standalone
+# ``apply_rotary_pos_emb(t, freqs)`` helper from June 2025 until #14181
+# ("Speed up anima a bit on nvidia", in 0.24.0), which deleted the function and
+# inlined its two call sites as ``comfy.quant_ops.ck.apply_rope_split_half(q, k,
+# rope_emb)``. The ``rope_emb`` *format* is unchanged across that refactor — only
+# the helper moved — so we keep a vendored copy of the original (numerically
+# identical, split-half convention) and prefer the in-tree symbol when present.
+try:  # ComfyUI < 0.24
+    from comfy.ldm.cosmos.predict2 import apply_rotary_pos_emb as _comfy_apply_rope
+except ImportError:  # ComfyUI >= 0.24 — standalone helper removed
+    _comfy_apply_rope = None
+
+
+def apply_rotary_pos_emb(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Apply cosmos split-half RoPE to a single [B, S, H, D] tensor.
+
+    Vendored from ComfyUI's pre-0.24 ``comfy.ldm.cosmos.predict2`` so the node
+    survives the helper's removal. The newer in-tree path applies rope to q and
+    k jointly (``apply_rope_split_half``); this per-tensor form is what the
+    extended-attention splice needs (cond q/k are produced separately from the
+    target stream), and it consumes the same ``freqs`` layout.
+    """
+    if _comfy_apply_rope is not None:
+        return _comfy_apply_rope(t, freqs)
+    t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).float()
+    t_out = freqs[..., 0] * t_[..., 0] + freqs[..., 1] * t_[..., 1]
+    t_out = t_out.movedim(-1, -2).reshape(*t.shape).type_as(t)
+    return t_out
 
 
 # ---------------------------------------------------------------------------
