@@ -29,7 +29,10 @@ Mechanism, per denoising step:
   - Each block's self-attention is replaced by an *extended* attention over
     ``[target_k ; cond_k]`` / ``[target_v ; cond_v]`` with a per-block additive
     logit bias ``b_cond`` on the cond columns (the trained gate). Cross-attn and
-    MLP run baseline.
+    MLP run baseline. This extended attention runs on flash-attn (via an exact
+    LSE decomposition of the joint softmax) when ComfyUI is launched with
+    ``--use-flash-attention`` and ``flash_attn`` is installed; otherwise it uses
+    a portable float-mask SDPA path. See ``_extended_self_attn``.
 
 Robustness: the per-block forward closures resolve their block from
 ``state.live_blocks`` (refreshed by the pre-hook from the live diffusion_model
@@ -64,6 +67,38 @@ try:  # ComfyUI < 0.24
     from comfy.ldm.cosmos.predict2 import apply_rotary_pos_emb as _comfy_apply_rope
 except ImportError:  # ComfyUI >= 0.24 — standalone helper removed
     _comfy_apply_rope = None
+
+# Optional flash-attention fast path for the extended self-attention. Mirrors
+# ComfyUI's own gating (comfy/ldm/modules/attention.py): the kernel is used only
+# when (a) ``flash_attn`` imports and (b) the user launched with
+# ``--use-flash-attention`` (surfaced as ``model_management.flash_attention_enabled()``).
+# Otherwise we fall back to the float-mask SDPA path, which works everywhere.
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+except ImportError:
+    _flash_attn_func = None
+
+_FLASH_ENABLED_CACHE: Optional[bool] = None
+
+
+def _flash_ext_enabled() -> bool:
+    """True iff flash-attn is importable AND ComfyUI was launched with
+    ``--use-flash-attention``. Result cached — the launch flag can't change
+    mid-process."""
+    global _FLASH_ENABLED_CACHE
+    if _FLASH_ENABLED_CACHE is None:
+        if _flash_attn_func is None:
+            _FLASH_ENABLED_CACHE = False
+        else:
+            try:
+                from comfy import model_management
+
+                _FLASH_ENABLED_CACHE = bool(model_management.flash_attention_enabled())
+            except Exception:
+                _FLASH_ENABLED_CACHE = False
+        if _FLASH_ENABLED_CACHE:
+            logger.info("EasyControl: flash-attention extended-attn path enabled.")
+    return _FLASH_ENABLED_CACHE
 
 
 def apply_rotary_pos_emb(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -323,7 +358,20 @@ def _build_cond_kv(dit, state: EasyControlState, device, dtype):
 def _extended_self_attn(tq, tk, tv, ck, cv, b_cond):
     """Attention of target queries over [target_k; cond_k] with an additive
     ``b_cond`` logit bias on the cond columns. All inputs [B, S, H, D] (cond may
-    be batch-1 and is broadcast). Returns [B, S, H, D]."""
+    be batch-1 and is broadcast). Returns [B, S, H, D].
+
+    Dispatches to the flash-attn LSE-decomposed path when enabled (see
+    ``_extended_self_attn_flash``); otherwise uses the portable float-mask SDPA
+    path. The float ``attn_mask`` forces SDPA onto its mem-efficient/math
+    backend (flash SDPA can't take arbitrary float masks), so the flash path is
+    a genuine speedup when available."""
+    if (
+        _flash_ext_enabled()
+        and tq.is_cuda
+        and tq.dtype in (torch.float16, torch.bfloat16)
+    ):
+        return _extended_self_attn_flash(tq, tk, tv, ck, cv, b_cond)
+
     B, S = tq.shape[0], tq.shape[1]
     if ck.shape[0] != B:
         ck = ck.expand(B, -1, -1, -1)
@@ -336,6 +384,42 @@ def _extended_self_attn(tq, tk, tv, ck, cv, b_cond):
     mask[S:] = b_cond.to(q.dtype)
     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.view(1, 1, 1, S + Sc))
     return out.transpose(1, 2)  # [B,S,H,D]
+
+
+def _extended_self_attn_flash(tq, tk, tv, ck, cv, b_cond):
+    """Flash-attn equivalent of ``_extended_self_attn`` via LSE decomposition.
+
+    The joint softmax over ``[target_k ; cond_k + b_cond]`` is split into two
+    independent flash attentions — one over target keys, one over cond keys —
+    then recombined by log-sum-exp. The uniform scalar ``b_cond`` bias on the
+    cond group is exact under this split: it cancels inside the cond group's own
+    normalization (so ``out_c`` is computed bias-free) and re-enters only as a
+    constant shift ``+b_cond`` on the cond group's LSE during the combine. This
+    is the forward half of anima_lora ``_ExtendedSelfAttnLSEFunc``.
+
+    flash_attn_func consumes ``[B, S, H, D]`` directly (no transpose) and
+    returns ``softmax_lse`` as ``[B, H, S]`` in the natural-log domain with the
+    softmax_scale already applied — matching SDPA's default ``1/sqrt(D)`` scale,
+    so the two paths are numerically equivalent."""
+    B = tq.shape[0]
+    if ck.shape[0] != B:
+        # flash requires matching batch dims; expand+contiguous (B is tiny — the
+        # CFG fan, typically 1–2 — so the cond-KV duplication is cheap).
+        ck = ck.expand(B, -1, -1, -1).contiguous()
+        cv = cv.expand(B, -1, -1, -1).contiguous()
+
+    out_t, lse_t, _ = _flash_attn_func(tq, tk, tv, return_attn_probs=True)
+    out_c, lse_c, _ = _flash_attn_func(tq, ck, cv, return_attn_probs=True)
+
+    # lse_*: [B, H, S], fp32. Shift the cond group by the trained scalar gate.
+    lse_c_b = lse_c + b_cond.to(lse_c.dtype)
+    log_z = torch.logaddexp(lse_t, lse_c_b)
+    w_t = torch.exp(lse_t - log_z)  # [B, H, S]
+    w_c = torch.exp(lse_c_b - log_z)
+    # weights → [B, S, H, 1] to scale the [B, S, H, D] flash outputs.
+    w_t = w_t.transpose(1, 2).unsqueeze(-1).to(out_t.dtype)
+    w_c = w_c.transpose(1, 2).unsqueeze(-1).to(out_c.dtype)
+    return out_t * w_t + out_c * w_c  # [B, S, H, D]
 
 
 def _make_self_attn_forward(state: EasyControlState, idx: int):
