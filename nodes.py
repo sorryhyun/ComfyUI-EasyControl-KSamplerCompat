@@ -32,9 +32,12 @@ def _vae_spatial(vae):
 
 
 def _resize_to_megapixels(image, vae, target_mp):
-    """Resize an IMAGE ``[B,H,W,C]`` (in [0,1]) to ~``target_mp`` megapixels,
-    aspect-preserving, snapping each side to ``vae_spatial * patch(2)`` so the
-    resulting latent has even dims (cosmos ``patch_spatial=2``).
+    """Resize an IMAGE ``[B,H,W,C]`` (in [0,1]) to at most ``target_mp``
+    megapixels, aspect-preserving, snapping each side to ``vae_spatial *
+    patch(2)`` so the resulting latent has even dims (cosmos ``patch_spatial=2``).
+
+    ``target_mp`` is a MAX cap: a source already below it is left at its native
+    resolution (only snapped) rather than upscaled.
 
     ``target_mp <= 0`` means keep the native resolution (still snapped, so the
     VAE/patch grid is clean). Returns the resized image ``[B,H,W,C]``.
@@ -44,7 +47,9 @@ def _resize_to_megapixels(image, vae, target_mp):
     mult_h, mult_w = sh * 2, sw * 2
 
     if target_mp and target_mp > 0:
-        scale = (target_mp * 1_000_000 / float(h * w)) ** 0.5
+        # target_mp is a MAX cap: only downscale when the source exceeds it,
+        # never upscale a smaller source (clamp scale to <= 1.0).
+        scale = min(1.0, (target_mp * 1_000_000 / float(h * w)) ** 0.5)
         new_h, new_w = h * scale, w * scale
     else:
         new_h, new_w = float(h), float(w)

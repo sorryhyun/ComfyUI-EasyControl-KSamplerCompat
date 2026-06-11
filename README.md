@@ -46,16 +46,17 @@ LoadImage ──► IMAGE ──┘            ▲
 ```
 
 - **`image`** — the conditioning image (the grayscale / lineart page for
-  colorization). It is resized to `target_megapixels` (aspect-preserving,
+  colorization). It is resized to at most `target_megapixels` (aspect-preserving,
   VAE/patch-snapped) and VAE-encoded once; the returned `LATENT` is sized to that
   same grid, so the cond stream and the sampled target share a resolution.
 - **`strength`** — scales the trained cond effect. `1.0` = as trained. Raise to
   push harder toward the reference, lower to loosen.
-- **`target_megapixels`** (optional) — output size in megapixels for the returned
-  latent and the cond encode. `1.0` (default) keeps generation on the ~1MP
-  distribution Anima was trained at; `0` keeps the input's native resolution
-  (still snapped to the VAE/patch grid). Feed the `LATENT` output into the
-  KSampler's `latent_image`.
+- **`target_megapixels`** (optional) — max output size in megapixels for the
+  returned latent and the cond encode. `1.0` (default) keeps generation on the
+  ~1MP distribution Anima was trained at by downscaling anything larger; a source
+  already below the cap is left at its native resolution (never upscaled). `0`
+  keeps the input's native resolution (still snapped to the VAE/patch grid). Feed
+  the `LATENT` output into the KSampler's `latent_image`.
 - **`cond_scale_override`** (optional) — replace the checkpoint's trained
   `cond_scale` outright (before `strength`); `0` = keep the trained value.
 
