@@ -44,6 +44,8 @@ instance — same hazard the in-tree Anima nodes document.
 from __future__ import annotations
 
 import logging
+import math
+import weakref
 from collections import OrderedDict
 from typing import Optional
 
@@ -52,6 +54,13 @@ import torch.nn.functional as F
 from einops import rearrange
 
 logger = logging.getLogger(__name__)
+
+# Every EasyControlState ever applied (weak — dead model outputs drop out).
+# Used to evict stale cond KV caches before building a new one: when the user
+# swaps the reference image, ComfyUI's execution cache can keep the previous
+# MODEL output (and its ~0.9 GB cond cache) alive next to the new one — the
+# classic image-swap OOM. See ``_build_cond_kv``.
+_LIVE_STATES: "weakref.WeakSet[EasyControlState]" = weakref.WeakSet()
 
 # ComfyUI backbone helpers. Imported at module load — this node only makes sense
 # inside a ComfyUI install, where these are always importable.
@@ -299,12 +308,15 @@ class EasyControlState:
         # Reference latent in *model space* (process_latent_in already applied by
         # the node). 4D [1, C, H, W]; given a device/dtype at prefill time.
         self.cond_latent: Optional[torch.Tensor] = None
+        # DiT hidden dim, filled in by install_easycontrol (for cache sizing).
+        self.hidden_dim: int = 0
 
         # Built lazily on first DiT forward.
         self.cond_kv_cache: Optional[list] = None
         self._cache_device = None
         # Refreshed each forward by the pre-hook from the live diffusion_model.
         self.live_blocks = None
+        _LIVE_STATES.add(self)
 
     def _to(self, device, dtype):
         for lst in (self.lora_qkv, self.lora_o, self.lora_ffn1, self.lora_ffn2,
@@ -375,6 +387,20 @@ def _build_cond_kv(dit, state: EasyControlState, device, dtype):
     block exactly as anima_lora ``precompute_cond_kv`` does, but against
     ComfyUI's split-projection block API.
     """
+    # Evict caches left by earlier applies (e.g. the previous reference image —
+    # its MODEL output can stay referenced by ComfyUI's execution cache, so its
+    # cond cache would sit next to the one we're about to build). Dropped caches
+    # rebuild lazily if that older model is ever sampled again.
+    dropped = 0
+    for other in list(_LIVE_STATES):
+        if other is not state and other.cond_kv_cache is not None:
+            other.cond_kv_cache = None
+            other._cache_device = None
+            dropped += 1
+    if dropped and device.type == "cuda":
+        torch.cuda.empty_cache()
+        logger.info(f"EasyControl: evicted {dropped} stale cond KV cache(s)")
+
     state._to(device, dtype)
     cond_latent = state.cond_latent.to(device=device, dtype=dtype)
     if cond_latent.ndim == 4:
@@ -572,6 +598,52 @@ def _make_self_attn_forward(state: EasyControlState, idx: int):
     return forward
 
 
+def _cond_cache_bytes(state: EasyControlState) -> int:
+    """Estimated VRAM of the per-block cond KV cache (2-byte sampling dtype)."""
+    if state.cond_latent is None or not state.hidden_dim:
+        return 0
+    h, w = state.cond_latent.shape[-2:]
+    tokens = math.ceil(h / 2) * math.ceil(w / 2)  # patch_spatial = 2
+    return state.num_blocks * 2 * tokens * state.hidden_dim * 2
+
+
+def _make_prepare_sampling_wrapper(state: EasyControlState):
+    """PREPARE_SAMPLING wrapper: reserve VRAM for the cond KV cache.
+
+    The cache (+ the one-off prefill walk) is allocated lazily inside the first
+    DiT forward, where comfy's memory manager can no longer make room — on
+    tight cards an image swap then OOMs mid-sampling. After comfy has sized and
+    loaded models for the run (the wrapped executor), ask ``free_memory`` to
+    hold the cache's worth of extra headroom free; it partially unloads loaded
+    models if needed, which is safe here (before any forward) and merely slower,
+    where the alternative was an OOM.
+    """
+
+    def prepare_sampling_wrapper(executor, model, noise_shape, conds, **kwargs):
+        out = executor(model, noise_shape, conds, **kwargs)
+        if state.cond_kv_cache is None:  # only when a prefill is pending
+            try:
+                from comfy import model_management
+
+                dev = model_management.get_torch_device()
+                extra = _cond_cache_bytes(state)
+                if extra and dev.type == "cuda":
+                    # Absolute free-VRAM floor: cache (+25% for the prefill
+                    # walk) + headroom for sampling activations. A no-op when
+                    # that much is already free; under real pressure it
+                    # partially unloads model weights instead of OOMing.
+                    floor = int(extra * 1.25) + (768 << 20)
+                    if model_management.get_free_memory(dev) < floor:
+                        model_management.free_memory(floor, dev)
+            except Exception:
+                logger.warning(
+                    "EasyControl: cond-cache VRAM reservation failed", exc_info=True
+                )
+        return out
+
+    return prepare_sampling_wrapper
+
+
 # ---------------------------------------------------------------------------
 # Pre-hook: lazy cond-KV prefill + live-block refresh
 # ---------------------------------------------------------------------------
@@ -673,9 +745,26 @@ def install_easycontrol(model, weight_path, cond_latent, strength, cond_scale_ov
             f"EasyControl checkpoint is for {state.num_blocks} blocks but the "
             f"loaded DiT has {nblocks}. Wrong base model?"
         )
+    state.hidden_dim = int(diffusion_model.blocks[0].x_dim)
 
     if state.train_adaln:
         _install_adaln_patches(model, diffusion_model, state, strength)
+
+    # Reserve VRAM for the lazily-built cond KV cache before sampling starts
+    # (comfy's memory manager can't see it otherwise — image-swap OOM source).
+    try:
+        from comfy.patcher_extension import WrappersMP
+
+        model.add_wrapper_with_key(
+            WrappersMP.PREPARE_SAMPLING,
+            "easycontrol_cond_cache",
+            _make_prepare_sampling_wrapper(state),
+        )
+    except Exception:
+        logger.warning(
+            "EasyControl: could not register PREPARE_SAMPLING wrapper; "
+            "cond-cache VRAM will not be pre-reserved", exc_info=True
+        )
 
     # Lazy-prefill pre-hook on diffusion_model (object-patched OrderedDict so it
     # reverts on unpatch and composes with other pre-hooks).

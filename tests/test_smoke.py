@@ -330,6 +330,34 @@ def test_adaln_plumbing():
     print("test_adaln_plumbing PASSED")
 
 
+def test_stale_cache_eviction():
+    """Building a cond KV cache must evict caches held by *other* states (the
+    image-swap OOM source: ComfyUI's execution cache keeps the previous MODEL
+    output — and its ~0.9GB cond cache — alive next to the new one), and the
+    cache-size estimate must match the actually built cache."""
+    dit = _stable_dit()
+    D = dit.model_channels
+    old = _build_state(len(dit.blocks), D, int(D * 4.0))
+    old.cond_latent = torch.randn(1, 4, 8, 8) * 0.5
+    ec._build_cond_kv(dit, old, torch.device("cpu"), torch.float32)
+    assert old.cond_kv_cache is not None
+
+    new = _build_state(len(dit.blocks), D, int(D * 4.0))
+    new.cond_latent = torch.randn(1, 4, 12, 8) * 0.5
+    ec._build_cond_kv(dit, new, torch.device("cpu"), torch.float32)
+    assert new.cond_kv_cache is not None
+    assert old.cond_kv_cache is None, "stale cache must be evicted on new build"
+    assert old._cache_device is None
+
+    # Size estimate: tokens = ceil(h/2)*ceil(w/2), 2 tensors per block, 2 bytes.
+    new.hidden_dim = D
+    est = ec._cond_cache_bytes(new)
+    S_c = new.cond_kv_cache[0][0].shape[1]
+    expect = len(dit.blocks) * 2 * S_c * D * 2
+    assert est == expect, (est, expect)
+    print("test_stale_cache_eviction PASSED")
+
+
 def test_inpaint_mask():
     """`_apply_inpaint_mask` gray-fills the selected region and leaves the rest
     pixel-identical, resizing a mismatched mask to the image grid."""
@@ -359,5 +387,6 @@ if __name__ == "__main__":
     test_key_guard()
     test_adaln_merge_and_cond_subtract()
     test_adaln_plumbing()
+    test_stale_cache_eviction()
     test_inpaint_mask()
     print("\nALL CHECKS PASSED")
