@@ -38,12 +38,39 @@ except ImportError:
             sys.path.insert(0, cand)
             break
 
+import types
+
 import torch
 
 import comfy.ops as ops
 from comfy.ldm.cosmos.predict2 import MiniTrainDIT
 
 import easycontrol_patch as ec
+
+# nodes.py imports `folder_paths` (a ComfyUI runtime module). Stub it so the
+# mask-helper unit test can import the node module without a full ComfyUI runtime.
+# Load by explicit path: a bare `import nodes` would resolve to ComfyUI's own
+# root-level nodes.py (comfy root is on sys.path for the predict2 import above).
+sys.modules.setdefault("folder_paths", types.SimpleNamespace(
+    get_filename_list=lambda *a, **k: [],
+    get_full_path=lambda *a, **k: None,
+))
+import importlib.util  # noqa: E402
+
+_checkout = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# nodes.py does `from .easycontrol_patch import ...`, so it must load inside a
+# package. Build a synthetic one rooted at the checkout dir.
+_pkg = types.ModuleType("ec_pkg")
+_pkg.__path__ = [_checkout]
+sys.modules["ec_pkg"] = _pkg
+for _sub in ("easycontrol_patch", "nodes"):
+    _spec = importlib.util.spec_from_file_location(
+        f"ec_pkg.{_sub}", os.path.join(_checkout, f"{_sub}.py")
+    )
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules[f"ec_pkg.{_sub}"] = _mod
+    _spec.loader.exec_module(_mod)
+ec_nodes = sys.modules["ec_pkg.nodes"]
 
 
 def test_extended_attn_math():
@@ -74,7 +101,7 @@ def test_extended_attn_math():
     print("test_extended_attn_math PASSED")
 
 
-def _stable_dit():
+def _stable_dit(use_adaln_lora=False):
     torch.manual_seed(0)
     dit = MiniTrainDIT(
         max_img_h=16, max_img_w=16, max_frames=1,
@@ -83,7 +110,8 @@ def _stable_dit():
         concat_padding_mask=True,
         model_channels=32, num_blocks=2, num_heads=2, mlp_ratio=4.0,
         crossattn_emb_channels=16,
-        pos_emb_cls="rope3d", use_adaln_lora=False,
+        pos_emb_cls="rope3d", use_adaln_lora=use_adaln_lora,
+        adaln_lora_dim=8,
         operations=ops.disable_weight_init,
     ).eval().float()
     # disable_weight_init leaves Linear weights UNINITIALIZED (ComfyUI expects a
@@ -105,7 +133,7 @@ def _stable_dit():
     return dit
 
 
-def _build_state(num_blocks, D, ffn, r=4):
+def _build_sd_meta(num_blocks, D, ffn, r=4, adaln_dim=0, adaln_r=2, adaln_alpha=4.0):
     sd = {}
     for i in range(num_blocks):
         sd[f"cond_lora_qkv.{i}.lora_down.weight"] = torch.randn(r, D) * 0.05
@@ -117,11 +145,27 @@ def _build_state(num_blocks, D, ffn, r=4):
         sd[f"cond_lora_ffn2.{i}.lora_down.weight"] = torch.randn(r, ffn) * 0.05
         sd[f"cond_lora_ffn2.{i}.lora_up.weight"] = torch.randn(D, r) * 0.05
         sd[f"b_cond.{i}"] = torch.tensor(0.0)
+        if adaln_dim:
+            for branch in ("self_attn", "cross_attn", "mlp"):
+                sd[f"adaln_lora_{branch}.{i}.lora_down.weight"] = (
+                    torch.randn(adaln_r, adaln_dim) * 0.05
+                )
+                sd[f"adaln_lora_{branch}.{i}.lora_up.weight"] = (
+                    torch.randn(3 * D, adaln_r) * 0.05
+                )
     meta = {
         "ss_num_blocks": str(num_blocks), "ss_cond_lora_dim": str(r),
         "ss_cond_lora_alpha": str(r), "ss_apply_ffn_lora": "1", "ss_cond_scale": "1.0",
     }
-    return ec.EasyControlState(sd, meta, strength=1.0)
+    if adaln_dim:
+        meta["ss_train_adaln"] = "1"
+        meta["ss_adaln_alpha"] = str(adaln_alpha)
+    return sd, meta
+
+
+def _build_state(num_blocks, D, ffn, r=4, strength=1.0, **kw):
+    sd, meta = _build_sd_meta(num_blocks, D, ffn, r=r, **kw)
+    return ec.EasyControlState(sd, meta, strength=strength)
 
 
 def test_plumbing():
@@ -154,7 +198,166 @@ def test_plumbing():
     print("test_plumbing PASSED")
 
 
+def test_inv_scale():
+    """A channel-scaled checkpoint's ``inv_scale`` must multiply the input
+    before the down GEMM (the trained function is ``up(down(x * inv))``)."""
+    torch.manual_seed(3)
+    D, r, out = 16, 4, 8
+    down = torch.randn(r, D)
+    up = torch.randn(out, r)
+    inv = torch.rand(D) * 4 + 0.1
+    x = torch.randn(2, D)
+    lora = ec._LoRA(down.clone(), up.clone(), alpha_over_r=0.5, inv_scale=inv.clone())
+    lora.to(torch.device("cpu"), torch.float32)
+    ref = 0.5 * (x * inv) @ down.t() @ up.t()
+    assert torch.allclose(lora(x), ref, atol=1e-5), "inv_scale must pre-scale the input"
+    print("test_inv_scale PASSED")
+
+
+def test_key_guard():
+    """State construction must consume every checkpoint tensor: unknown keys
+    raise (a silently dropped trained feature = garbage output), and adaln
+    checkpoints must be complete."""
+    D, ffn = 32, 128
+
+    sd, meta = _build_sd_meta(2, D, ffn)
+    sd["some_future_feature.0.weight"] = torch.zeros(3)
+    try:
+        ec.EasyControlState(sd, meta, strength=1.0)
+        raise AssertionError("unknown key must raise")
+    except ValueError as e:
+        assert "some_future_feature" in str(e)
+
+    # inv_scale keys are known (consumed), not "unknown".
+    sd, meta = _build_sd_meta(2, D, ffn)
+    sd["cond_lora_qkv.0.inv_scale"] = torch.ones(D)
+    state = ec.EasyControlState(sd, meta, strength=1.0)
+    assert state.lora_qkv[0].inv_scale is not None
+
+    # Metadata says train_adaln but tensors are missing → truncated checkpoint.
+    sd, meta = _build_sd_meta(2, D, ffn)
+    meta["ss_train_adaln"] = "1"
+    try:
+        ec.EasyControlState(sd, meta, strength=1.0)
+        raise AssertionError("ss_train_adaln without tensors must raise")
+    except ValueError as e:
+        assert "truncated" in str(e)
+
+    # Partial adaln coverage → truncated checkpoint.
+    sd, meta = _build_sd_meta(2, D, ffn, adaln_dim=8)
+    del sd["adaln_lora_mlp.1.lora_down.weight"]
+    del sd["adaln_lora_mlp.1.lora_up.weight"]
+    try:
+        ec.EasyControlState(sd, meta, strength=1.0)
+        raise AssertionError("partial adaln must raise")
+    except ValueError as e:
+        assert "adaln_lora_mlp" in str(e)
+    print("test_key_guard PASSED")
+
+
+def test_adaln_merge_and_cond_subtract():
+    """The two halves of adaln handling must cancel exactly:
+
+    - target stream: merging ``strength * (alpha/r) * up @ down`` onto
+      ``adaln_modulation_*.2.weight`` (what the ModelPatcher patch computes)
+      equals the training-side ``adaln_up(h) + strength * delta(h)``;
+    - cond stream: ``_cond_branch_modulation`` on the *merged* weights
+      reproduces the un-merged (frozen) modulation — training never applies the
+      adaln delta on the cond side.
+    """
+    torch.manual_seed(4)
+    dit = _stable_dit(use_adaln_lora=True)
+    D = dit.model_channels
+    adaln_dim = dit.blocks[0].adaln_modulation_self_attn[1].weight.shape[0]
+    strength = 0.7
+    state = _build_state(len(dit.blocks), D, int(D * 4.0),
+                         adaln_dim=adaln_dim, strength=strength)
+    assert state.train_adaln and state.adaln_rank == 2
+
+    emb = torch.randn(1, 1, D)
+    for idx, block in enumerate(dit.blocks):
+        for branch in ("self_attn", "cross_attn", "mlp"):
+            seq = getattr(block, f"adaln_modulation_{branch}")
+            delta = state.adaln[branch][idx]
+            base_out = seq(emb)
+
+            # Merge the patch the way comfy's LoRAAdapter does (strength * α/r * up@down).
+            merged_w = (
+                seq[2].weight
+                + strength * delta.scale * (delta.up.float() @ delta.down.float())
+            )
+            h = seq[1](seq[0](emb))
+            target_merged = h @ merged_w.t()
+            target_train = seq[2](h) + strength * delta(h)  # training-side form
+            assert torch.allclose(target_merged, target_train, atol=1e-5), (
+                f"merged patch != training delta on {branch}.{idx}"
+            )
+
+            # Cond stream: subtract on merged weights recovers the frozen base.
+            orig = seq[2].weight.data.clone()
+            seq[2].weight.data.copy_(merged_w)
+            try:
+                cond_out = ec._cond_branch_modulation(seq, emb, delta, strength)
+            finally:
+                seq[2].weight.data.copy_(orig)
+            assert torch.allclose(cond_out, base_out, atol=1e-5), (
+                f"cond subtract must recover frozen modulation on {branch}.{idx}"
+            )
+    print("test_adaln_merge_and_cond_subtract PASSED")
+
+
+def test_adaln_plumbing():
+    """End-to-end wiring on an adaln-lora DiT: cond-KV prefill (which exercises
+    the subtract path) + full patched forward stay finite."""
+    dit = _stable_dit(use_adaln_lora=True)
+    D = dit.model_channels
+    adaln_dim = dit.blocks[0].adaln_modulation_self_attn[1].weight.shape[0]
+    state = _build_state(len(dit.blocks), D, int(D * 4.0), adaln_dim=adaln_dim)
+
+    state.cond_latent = torch.randn(1, 4, 8, 8) * 0.5
+    state.live_blocks = dit.blocks
+    ec._build_cond_kv(dit, state, torch.device("cpu"), torch.float32)
+    assert state.cond_kv_cache is not None
+    for k, v in state.cond_kv_cache:
+        assert torch.isfinite(k).all() and torch.isfinite(v).all()
+
+    for idx in range(len(dit.blocks)):
+        dit.blocks[idx].self_attn.forward = ec._make_self_attn_forward(state, idx)
+    x = torch.randn(1, 4, 1, 8, 8) * 0.5
+    with torch.no_grad():
+        out = dit(x, torch.tensor([0.5]), torch.randn(1, 7, 16) * 0.5)
+    assert out.shape == (1, 4, 1, 8, 8) and torch.isfinite(out).all()
+    print("test_adaln_plumbing PASSED")
+
+
+def test_inpaint_mask():
+    """`_apply_inpaint_mask` gray-fills the selected region and leaves the rest
+    pixel-identical, resizing a mismatched mask to the image grid."""
+    gray = ec_nodes._INPAINT_GRAY
+    pixels = torch.rand(1, 8, 8, 3)
+
+    # Same-size mask: left half selected (hole), right half kept.
+    mask = torch.zeros(1, 8, 8)
+    mask[:, :, :4] = 1.0
+    out = ec_nodes._apply_inpaint_mask(pixels, mask)
+    assert torch.allclose(out[:, :, :4, :], torch.full_like(out[:, :, :4, :], gray))
+    assert torch.allclose(out[:, :, 4:, :], pixels[:, :, 4:, :]), "kept region must be untouched"
+
+    # Mismatched mask resolution must be resized to the image grid (no crash, hole present).
+    coarse = torch.zeros(1, 2, 2)
+    coarse[:, 0, 0] = 1.0
+    out2 = ec_nodes._apply_inpaint_mask(pixels, coarse)
+    assert torch.allclose(out2[:, :4, :4, :], torch.full_like(out2[:, :4, :4, :], gray))
+    assert torch.allclose(out2[:, 4:, 4:, :], pixels[:, 4:, 4:, :])
+    print("test_inpaint_mask PASSED")
+
+
 if __name__ == "__main__":
     test_extended_attn_math()
     test_plumbing()
+    test_inv_scale()
+    test_key_guard()
+    test_adaln_merge_and_cond_subtract()
+    test_adaln_plumbing()
+    test_inpaint_mask()
     print("\nALL CHECKS PASSED")

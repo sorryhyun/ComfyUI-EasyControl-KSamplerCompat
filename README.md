@@ -51,6 +51,13 @@ LoadImage ──► IMAGE ──┘            ▲
   same grid, so the cond stream and the sampled target share a resolution.
 - **`strength`** — scales the trained cond effect. `1.0` = as trained. Raise to
   push harder toward the reference, lower to loosen.
+- **`mask`** (optional) — an inpaint mask for the `inpaint` adapter. Wire the
+  **original** image into `image` and a mask here; the node fills the white
+  (selected) region with mid-gray and encodes that as the conditioning image —
+  reproducing what the `inpaint` adapter trained on (cond = original image with a
+  free-form gray hole). The DiT then regenerates the hole consistent with the
+  surrounding pixels and the prompt. Leave unconnected for adapters that take a
+  pre-built cond image (e.g. colorize).
 - **`target_megapixels`** (optional) — max output size in megapixels for the
   returned latent and the cond encode. `1.0` (default) keeps generation on the
   ~1MP distribution Anima was trained at by downscaling anything larger; a source
@@ -89,6 +96,18 @@ thirds and added onto the split projections; the base weights are numerically
 identical between the two DiTs (same pretrained model, fused-vs-split layout),
 so this reproduces what training saw. No anima_lora vendoring required — it uses
 only ComfyUI's own modules plus the checkpoint tensors.
+
+Checkpoints trained with **`train_adaln`** (target-stream AdaLN LoRA — per-block
+deltas on the `adaln_modulation_{self_attn,cross_attn,mlp}` up-projections) are
+fully supported: the deltas are merged as ordinary ModelPatcher weight patches
+(scaled by `strength`, composing with lowvram loading, block compile, and other
+LoRAs), while the cond-stream prefill subtracts them again so the reference
+stream sees the frozen modulation exactly as training did. Channel-scaled
+checkpoints (`*.inv_scale` tensors from anima_lora's per-channel gradient
+rebalance) are also applied faithfully. The loader is **strict**: a checkpoint
+carrying tensors this node doesn't implement is refused with an error instead of
+silently dropping them (a dropped trained feature degrades output with no
+warning — if you hit this, update the node).
 
 ## Known limitations / notes
 

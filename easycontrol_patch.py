@@ -142,23 +142,42 @@ class _LoRA:
     bottleneck runs in fp32 for bf16 stability, the ``alpha/r`` scale is folded
     in here, and the caller-side ``cond_scale * strength`` is applied via
     ``eff_scale`` at the call site.
+
+    ``inv_scale`` is the per-input-channel factor of a channel-scaled checkpoint
+    (anima_lora SmoothQuant-style rebalance: the calibration scale ``s`` is
+    absorbed into ``lora_down`` at init and ``inv_scale = 1/s`` is stored so the
+    forward stays ``x @ down`` in effect). The trained function is
+    ``up(down((x * inv_scale)))`` — skipping it mis-scales every input channel
+    by ``s``.
     """
 
-    __slots__ = ("down", "up", "scale")
+    __slots__ = ("down", "up", "scale", "inv_scale")
 
-    def __init__(self, down: torch.Tensor, up: torch.Tensor, alpha_over_r: float):
+    def __init__(
+        self,
+        down: torch.Tensor,
+        up: torch.Tensor,
+        alpha_over_r: float,
+        inv_scale: Optional[torch.Tensor] = None,
+    ):
         self.down = down
         self.up = up
         self.scale = alpha_over_r
+        self.inv_scale = inv_scale
 
     def to(self, device, dtype):
         # Keep master copies in fp32 (the forward casts to fp32 anyway).
         self.down = self.down.to(device=device, dtype=torch.float32)
         self.up = self.up.to(device=device, dtype=torch.float32)
+        if self.inv_scale is not None:
+            self.inv_scale = self.inv_scale.to(device=device, dtype=torch.float32)
         return self
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.linear(x.float(), self.down)
+        h = x.float()
+        if self.inv_scale is not None:
+            h = h * self.inv_scale
+        h = F.linear(h, self.down)
         h = F.linear(h, self.up)
         return (h * self.scale).to(x.dtype)
 
@@ -183,13 +202,21 @@ class EasyControlState:
         # effective scale (matches anima_lora get_effective_scale + multiplier).
         a_over_r = self.alpha / self.r if self.r > 0 else 1.0
         self.eff_scale = cond_scale * float(strength)
+        self.strength = float(strength)
 
-        def grab(prefix, idx):
-            d = sd.get(f"{prefix}.{idx}.lora_down.weight")
-            u = sd.get(f"{prefix}.{idx}.lora_up.weight")
+        consumed = set()
+
+        def grab(prefix, idx, alpha_over_r=a_over_r):
+            dk = f"{prefix}.{idx}.lora_down.weight"
+            uk = f"{prefix}.{idx}.lora_up.weight"
+            sk = f"{prefix}.{idx}.inv_scale"
+            d, u, inv = sd.get(dk), sd.get(uk), sd.get(sk)
             if d is None or u is None:
                 return None
-            return _LoRA(d, u, a_over_r)
+            consumed.update((dk, uk))
+            if inv is not None:
+                consumed.add(sk)
+            return _LoRA(d, u, alpha_over_r, inv_scale=inv)
 
         self.lora_qkv = [grab("cond_lora_qkv", i) for i in range(self.num_blocks)]
         self.lora_o = [grab("cond_lora_o", i) for i in range(self.num_blocks)]
@@ -201,16 +228,72 @@ class EasyControlState:
             self.lora_ffn2 = [None] * self.num_blocks
 
         # b_cond stored as a ParameterList → keys "b_cond.{i}" (0-d tensors).
-        self.b_cond = [
-            sd.get(f"b_cond.{i}", torch.tensor(-10.0)).float().reshape(())
-            for i in range(self.num_blocks)
-        ]
+        self.b_cond = []
+        for i in range(self.num_blocks):
+            b = sd.get(f"b_cond.{i}")
+            if b is not None:
+                consumed.add(f"b_cond.{i}")
+            self.b_cond.append(
+                (b if b is not None else torch.tensor(-10.0)).float().reshape(())
+            )
 
         if any(q is None for q in self.lora_qkv):
             missing = [i for i, q in enumerate(self.lora_qkv) if q is None]
             raise ValueError(
                 f"EasyControl checkpoint missing cond_lora_qkv for blocks {missing}. "
                 "Is this an EasyControl (networks.methods.easycontrol) checkpoint?"
+            )
+
+        # ---- target-stream adaln LoRA (train_adaln checkpoints) ----
+        # Per-block, per-branch delta on the AdaLN-LoRA up-projections
+        # (anima_lora ``adaln_up_{self_attn,cross_attn,mlp}``, 256 -> 3D). Comfy's
+        # split layout is ``adaln_modulation_{branch} = Sequential(SiLU,
+        # Linear(D->256), Linear(256->3D))`` with identical numerics, so each
+        # delta merges exactly onto ``adaln_modulation_{branch}.2.weight`` as an
+        # ordinary LoRA weight patch (see ``install_easycontrol``). The scale is
+        # ``strength * adaln_alpha / adaln_rank`` — training applies the delta at
+        # ``delta_scale = multiplier``, NOT ``cond_scale * multiplier``.
+        adaln_probe = sd.get("adaln_lora_self_attn.0.lora_down.weight")
+        self.train_adaln = adaln_probe is not None
+        self.adaln_rank = int(adaln_probe.shape[0]) if self.train_adaln else 0
+        adaln_alpha = float(meta.get("ss_adaln_alpha", 0.0))
+        if self.train_adaln and adaln_alpha <= 0.0:
+            # √r law fallback, mirroring anima_lora (alpha<=0 → derive from the
+            # cond LoRA's alpha/dim so alpha/√r stays consistent).
+            adaln_alpha = self.alpha * (self.adaln_rank / max(self.r, 1)) ** 0.5
+        self.adaln_alpha = adaln_alpha
+        self.adaln = {}  # branch -> list[_LoRA | None], for the cond-prefill subtract
+        if self.train_adaln:
+            aa_over_r = adaln_alpha / self.adaln_rank
+            for branch in ("self_attn", "cross_attn", "mlp"):
+                mods = [
+                    grab(f"adaln_lora_{branch}", i, alpha_over_r=aa_over_r)
+                    for i in range(self.num_blocks)
+                ]
+                if any(m is None for m in mods):
+                    missing = [i for i, m in enumerate(mods) if m is None]
+                    raise ValueError(
+                        f"EasyControl checkpoint has adaln_lora keys but is missing "
+                        f"adaln_lora_{branch} for blocks {missing} — truncated checkpoint?"
+                    )
+                self.adaln[branch] = mods
+        elif bool(int(meta.get("ss_train_adaln", 0) or 0)):
+            raise ValueError(
+                "EasyControl checkpoint metadata says ss_train_adaln=1 but no "
+                "adaln_lora_* tensors are present — truncated checkpoint?"
+            )
+
+        # ---- strict key accounting ----
+        # A trained feature this node silently drops degrades output with no
+        # error (this is exactly how un-applied adaln checkpoints produced
+        # garbage) — so refuse checkpoints carrying tensors we don't map.
+        leftover = sorted(set(sd) - consumed)
+        if leftover:
+            shown = ", ".join(leftover[:8]) + (", …" if len(leftover) > 8 else "")
+            raise ValueError(
+                f"EasyControl checkpoint has {len(leftover)} tensor(s) this node "
+                f"does not implement ({shown}). The checkpoint was trained with a "
+                "feature newer than this node — update the node."
             )
 
         # Reference latent in *model space* (process_latent_in already applied by
@@ -224,7 +307,8 @@ class EasyControlState:
         self.live_blocks = None
 
     def _to(self, device, dtype):
-        for lst in (self.lora_qkv, self.lora_o, self.lora_ffn1, self.lora_ffn2):
+        for lst in (self.lora_qkv, self.lora_o, self.lora_ffn1, self.lora_ffn2,
+                    *self.adaln.values()):
             for m in lst:
                 if m is not None:
                     m.to(device, dtype)
@@ -234,6 +318,21 @@ class EasyControlState:
 # ---------------------------------------------------------------------------
 # Cond stream prefill (build per-block KV cache)
 # ---------------------------------------------------------------------------
+
+
+def _cond_branch_modulation(seq, emb, adaln_delta, strength):
+    """Modulation for one adaln branch of the *cond* stream.
+
+    Training applies the target-stream adaln delta only on the target side —
+    the cond stream always runs the frozen ``adaln_up_*``. With the delta merged
+    into ``seq[2].weight`` as a weight patch (see ``install_easycontrol``), the
+    live module would leak it into the cond stream, so run the bottleneck
+    stepwise and subtract the merged delta from the up output.
+    """
+    if adaln_delta is None:
+        return seq(emb)
+    h = seq[1](seq[0](emb))  # SiLU -> down: [B, adaln_dim]
+    return seq[2](h) - strength * adaln_delta(h)
 
 
 def _cond_qkv(attn, cond_normed, lora_qkv, eff_scale, rope):
@@ -306,12 +405,20 @@ def _build_cond_kv(dit, state: EasyControlState, device, dtype):
         block = dit.blocks[idx]
         attn = block.self_attn
 
+        d_sa = state.adaln["self_attn"][idx] if state.train_adaln else None
+        d_mlp = state.adaln["mlp"][idx] if state.train_adaln else None
         if block.use_adaln_lora:
             s_sa, sc_sa, g_sa = (
-                block.adaln_modulation_self_attn(cemb) + cadaln
+                _cond_branch_modulation(
+                    block.adaln_modulation_self_attn, cemb, d_sa, state.strength
+                )
+                + cadaln
             ).chunk(3, dim=-1)
             s_mlp, sc_mlp, g_mlp = (
-                block.adaln_modulation_mlp(cemb) + cadaln
+                _cond_branch_modulation(
+                    block.adaln_modulation_mlp, cemb, d_mlp, state.strength
+                )
+                + cadaln
             ).chunk(3, dim=-1)
         else:
             s_sa, sc_sa, g_sa = block.adaln_modulation_self_attn(cemb).chunk(3, dim=-1)
@@ -483,6 +590,67 @@ def _make_prefill_pre_hook(state: EasyControlState):
     return pre_hook
 
 
+def _install_adaln_patches(model, diffusion_model, state: EasyControlState, strength):
+    """Merge the target-stream adaln LoRA as ordinary ModelPatcher weight patches.
+
+    Each per-branch delta lands on ``adaln_modulation_{branch}.2.weight`` (the
+    256->3D up-projection — comfy's split-Sequential twin of anima_lora's
+    ``adaln_up_{branch}``; both are bias-free, and the 256-dim bottleneck value
+    is identical between the fused and split layouts, so the weight merge is
+    exact). Going through ``add_patches`` keeps this comfy-native: it composes
+    with lowvram partial loading, block compile, and other LoRAs, and reverts on
+    unpatch. Patch strength = node strength, matching training's
+    ``delta_scale = multiplier``. The cond stream must NOT see these patches —
+    ``_cond_branch_modulation`` subtracts them during prefill.
+    """
+    b0 = diffusion_model.blocks[0]
+    if not getattr(b0, "use_adaln_lora", False):
+        raise ValueError(
+            "EasyControl checkpoint carries target-stream adaln LoRA "
+            "(train_adaln) but the loaded DiT uses vanilla adaln MLPs "
+            "(use_adaln_lora=False). Wrong base model?"
+        )
+    probe = state.adaln["self_attn"][0]
+    seq = b0.adaln_modulation_self_attn
+    delta_shape = (probe.up.shape[0], probe.down.shape[1])
+    if len(seq) != 3 or tuple(seq[2].weight.shape) != delta_shape:
+        got = tuple(seq[2].weight.shape) if len(seq) == 3 else "not a bottleneck"
+        raise ValueError(
+            f"adaln shape mismatch: checkpoint delta is {delta_shape} but the "
+            f"DiT's adaln_modulation up-projection is {got}."
+        )
+
+    try:  # current comfy: loras are WeightAdapterBase instances
+        from comfy.weight_adapter import LoRAAdapter
+
+        def make_patch(m):
+            return LoRAAdapter(
+                set(), (m.up, m.down, state.adaln_alpha, None, None, None)
+            )
+    except ImportError:  # older comfy: ("lora", 6-tuple) patch format
+
+        def make_patch(m):
+            return ("lora", (m.up, m.down, state.adaln_alpha, None, None, None))
+
+    patches = {}
+    for branch in ("self_attn", "cross_attn", "mlp"):
+        for i, m in enumerate(state.adaln[branch]):
+            key = f"diffusion_model.blocks.{i}.adaln_modulation_{branch}.2.weight"
+            patches[key] = make_patch(m)
+    applied = model.add_patches(patches, strength_patch=float(strength))
+    if len(applied) != len(patches):
+        missing = sorted(set(patches) - set(applied))[:4]
+        raise ValueError(
+            f"adaln weight patches failed to attach ({len(applied)}/{len(patches)} "
+            f"applied; e.g. {missing}). ComfyUI key layout changed?"
+        )
+    logger.info(
+        f"EasyControl: merged target-stream adaln LoRA "
+        f"(r={state.adaln_rank}, alpha={state.adaln_alpha:g}, "
+        f"{len(patches)} patches, strength={float(strength):.3f})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public entry point — called by the node
 # ---------------------------------------------------------------------------
@@ -506,6 +674,9 @@ def install_easycontrol(model, weight_path, cond_latent, strength, cond_scale_ov
             f"loaded DiT has {nblocks}. Wrong base model?"
         )
 
+    if state.train_adaln:
+        _install_adaln_patches(model, diffusion_model, state, strength)
+
     # Lazy-prefill pre-hook on diffusion_model (object-patched OrderedDict so it
     # reverts on unpatch and composes with other pre-hooks).
     pre_hook = _make_prefill_pre_hook(state)
@@ -528,6 +699,7 @@ def install_easycontrol(model, weight_path, cond_latent, strength, cond_scale_ov
     model._easycontrol_states.append(state)
     logger.info(
         f"EasyControl: installed ({state.num_blocks} blocks, r={state.r}, "
-        f"ffn_lora={state.apply_ffn}, eff_scale={state.eff_scale:.3f})"
+        f"ffn_lora={state.apply_ffn}, adaln={state.train_adaln}, "
+        f"eff_scale={state.eff_scale:.3f})"
     )
     return state
