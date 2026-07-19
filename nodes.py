@@ -60,9 +60,43 @@ def _resize_to_megapixels(image, vae, target_mp):
         return image
 
     # IMAGE [B,H,W,C] → [B,C,H,W] for interpolate → back.
+    # antialias=True is essential: the reference is almost always *downscaled*
+    # (target_mp caps at ~1MP, sources are larger), and plain bilinear without
+    # anti-aliasing both softens the cond and aliases high-frequency detail
+    # (manga lines, fine texture), which locally shifts averaged colors — the
+    # cond then looks blurred / colour-off. bicubic+antialias matches the LANCZOS
+    # resampling the repo's own inference path uses (library/inference/
+    # generation.py), so the node's cond latent tracks the trained distribution.
     chw = image.permute(0, 3, 1, 2)
-    chw = F.interpolate(chw, size=(snap_h, snap_w), mode="bilinear", align_corners=False)
+    chw = F.interpolate(
+        chw, size=(snap_h, snap_w), mode="bicubic", antialias=True
+    ).clamp_(0.0, 1.0)
     return chw.permute(0, 2, 3, 1).contiguous()
+
+
+# Mid-gray fill for the inpaint hole, matching the training-time convention
+# (easycontrol_adapters/inpainting/mask_image.py ``GRAY = 128`` in [0,255]). The
+# VAE input transform is ``x*2 - 1`` on a [0,1] image, so 128/255 ≈ 0.502 → ~0 in
+# [-1,1] — a flat latent region the cond LoRA + b_cond gate learn as "regenerate
+# here." Must match training or the hole reads off-distribution.
+_INPAINT_GRAY = 128.0 / 255.0
+
+
+def _apply_inpaint_mask(pixels, mask):
+    """Gray-fill the masked region of ``pixels`` ([1,H,W,C], [0,1]) → inpaint cond.
+
+    ``mask`` is a ComfyUI MASK ([B,H,W], [0,1]); the *selected* region (value 1)
+    is the hole to regenerate. The mask is resized (nearest, to preserve the hard
+    hole edge the synthetic LaMa masks have) to the image grid and thresholded at
+    0.5, then those pixels are set to mid-gray — reproducing what the inpaint
+    training saw (cond = original image with a free-form gray hole).
+    """
+    _, h, w, _ = pixels.shape
+    m = mask[:1].to(pixels.device, pixels.dtype)  # [1,Hm,Wm]
+    if m.shape[-2:] != (h, w):
+        m = F.interpolate(m.unsqueeze(1), size=(h, w), mode="nearest").squeeze(1)
+    hole = (m > 0.5).unsqueeze(-1)  # [1,H,W,1]
+    return torch.where(hole, pixels.new_full((), _INPAINT_GRAY), pixels)
 
 
 class AnimaEasyControlPatch:
@@ -122,6 +156,20 @@ class AnimaEasyControlPatch:
                 ),
             },
             "optional": {
+                "mask": (
+                    "MASK",
+                    {
+                        "tooltip": (
+                            "Optional inpaint mask. White (selected) region is the "
+                            "hole to regenerate: the node fills it with mid-gray and "
+                            "encodes that as the conditioning image, matching the "
+                            "`inpaint` adapter's training (cond = original image with "
+                            "a gray hole). Wire the ORIGINAL image into the IMAGE "
+                            "socket and the mask here. Leave unconnected for adapters "
+                            "that take a pre-built cond image (e.g. colorize)."
+                        )
+                    },
+                ),
                 "target_megapixels": (
                     "FLOAT",
                     {
@@ -171,7 +219,7 @@ class AnimaEasyControlPatch:
     )
 
     def apply(self, model, vae, image, base_model, easycontrol_lora, strength,
-              target_megapixels=1.0, cond_scale_override=0.0):
+              mask=None, target_megapixels=1.0, cond_scale_override=0.0):
         # base_model is an informational guard — only "anima" is offered today.
         del base_model
         new_model = model.clone()
@@ -186,6 +234,10 @@ class AnimaEasyControlPatch:
         # the cond encode and the returned target latent share one grid.
         pixels = image[:1, :, :, :3]
         pixels = _resize_to_megapixels(pixels, vae, float(target_megapixels))
+        # Inpaint: gray-fill the masked hole AFTER resizing, so the gray region
+        # lands on the cond's own (snapped) grid — matching the training cond.
+        if mask is not None:
+            pixels = _apply_inpaint_mask(pixels, mask)
         vae_latent = vae.encode(pixels)  # ComfyUI latent space [1, C, h, w]
 
         # Map into the DiT's input space — the same transform apply_model applies
