@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-easycontrol-ksamplercompat"
-description = "KSampler-compatible Anima EasyControl image conditioning for ComfyUI. A single model-patch node (MODEL + VAE + IMAGE -> MODEL) that feeds a reference image into the Anima DiT's frozen extended self-attention stream and returns a patched MODEL for the stock KSampler — no dedicated sampler node. Reimplements anima_lora's EasyControl inference path against ComfyUI's native Anima/Cosmos DiT backbone (split q/k/v projections). EasyControl checkpoints go in models/loras/. Typical use: grayscale/lineart -> color (colorization)."
-version = "0.2.1"
+description = "KSampler-compatible Anima EasyControl image conditioning for ComfyUI. A model-patch node (MODEL + VAE + IMAGE -> MODEL) that feeds a reference image into the Anima DiT's frozen extended self-attention stream and returns a patched MODEL for the stock KSampler — no dedicated sampler node. Reimplements anima_lora's EasyControl inference path against ComfyUI's native Anima/Cosmos DiT backbone (split q/k/v projections). EasyControl checkpoints go in models/loras/. Uses: grayscale/lineart -> color (colorization), and EasyEdit — reference image + tag-delta instruction -> edited re-render in one pass, no inversion (two CPU-only instruction-builder nodes included)."
+version = "0.3.0"
 license = { file = "LICENSE" }
 dependencies = []
 

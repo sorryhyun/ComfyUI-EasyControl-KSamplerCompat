@@ -2,8 +2,9 @@
 
 KSampler-compatible **Anima EasyControl** image conditioning for ComfyUI.
 
-One node — **`Anima EasyControl (KSampler)`** — takes `MODEL + VAE + IMAGE` and
-returns a `MODEL` plus an empty `LATENT` sized to the conditioning resolution.
+The main node — **`Anima EasyControl (KSampler)`** — takes `MODEL + VAE + IMAGE`
+and returns a `MODEL` plus an empty `LATENT` sized to the conditioning
+resolution.
 The reference-image conditioning rides on the returned model as a set of
 ModelPatcher object-patches, so it flows straight into the **stock KSampler** and
 composes with the rest of your graph (schedulers, ControlNet, other adapters).
@@ -16,12 +17,20 @@ This is deliberately unlike the upstream Flux / Qwen EasyControl ComfyUI nodes,
 which make you load a model through a dedicated loader and sample with a
 **dedicated sampler node**. Here there is no custom sampler — just a model patch.
 
+Two CPU-only helper nodes ride along for **EasyEdit**, the instruction-editing
+use of the same path — see [EasyEdit](#easyedit--edit-by-instruction-no-inversion).
+
 ## What it's for
 
 EasyControl is a frozen-DiT reference-image adapter for the Anima model. The
 flagship use case is **colorization**: feed a grayscale / manga line page into
 the `IMAGE` socket and a color prompt into your normal text encode, and the DiT
 colorizes the reference while respecting its structure.
+
+The second use is **EasyEdit**: with the `subject_edit` checkpoint the same node
+becomes a reference + instruction editor — give it a character and a list of
+changes, get that character re-rendered with the changes applied, in one pass
+and with no inversion.
 
 ## Install
 
@@ -30,8 +39,11 @@ colorizes the reference while respecting its structure.
    git clone https://github.com/sorryhyun/ComfyUI-EasyControl-KSamplerCompat
    ```
 2. Put your EasyControl checkpoint (`*.safetensors` trained with
-   `networks.methods.easycontrol`, e.g. the colorize adapter) in
-   `ComfyUI/models/loras/`.
+   `networks.methods.easycontrol`) in `ComfyUI/models/loras/`. Published
+   adapters live in
+   [`sorryhyun/anima-easycontrol-adapters`](https://huggingface.co/sorryhyun/anima-easycontrol-adapters):
+   `anima_colorize_v2.safetensors` (colorization) and
+   `anima_subject_edit_alpha.safetensors` (EasyEdit).
 3. Restart ComfyUI.
 
 ## Wiring
@@ -71,6 +83,124 @@ Text prompt: encode it the normal way and feed the KSampler's positive/negative
 as usual. For the colorize adapter, the prompt carries **color** facts the
 lineart can't (`"pink hair, blue eyes, white dress"`); structure comes from the
 reference image.
+
+## EasyEdit — edit by instruction, no inversion
+
+**EasyEdit is a checkpoint plus a prompting convention, not a new node.** It
+rides the exact path above: reference image into `image`, an *edit instruction*
+into your positive text encode, one plain KSampler run. No inversion pass, no
+anchor, no mask, no offset tuning.
+
+- **Checkpoint**: `anima_subject_edit_alpha.safetensors` from
+  [`sorryhyun/anima-easycontrol-adapters`](https://huggingface.co/sorryhyun/anima-easycontrol-adapters)
+  → `ComfyUI/models/loras/`.
+- **Workflow**: [`workflows/easyedit.json`](workflows/easyedit.json) — drag it
+  into ComfyUI. Core nodes plus this repo only.
+
+### What it does
+
+Give it a picture of a character and a list of changes; it re-renders that
+character with the changes applied. It preserves **identity and appearance**,
+not composition — expect a new pose/framing that is recognizably the same
+character. That is the opposite trade from the
+[DirectEdit node](https://github.com/sorryhyun/anima_lora), which preserves the
+original pixels and edits in place at the cost of a second (inversion) pass:
+
+| | DirectEdit | EasyEdit |
+|---|---|---|
+| Semantics | edit THIS image in place | re-render with these changes |
+| Preserves | composition + unchanged pixels | identity / appearance |
+| Cost | 2 passes | 1 generation |
+| Inputs | image + source/target captions | image + delta instruction |
+| Weak spot | hard images | object removals |
+
+### The prompting convention
+
+The prompt is a **tag delta**, not a caption. Additions first as bare tags, then
+removals prefixed with `-`:
+
+```
+wading in water, night, smile, -chair, -ramune
+```
+
+Rules that matter:
+
+- **Instruction, never a full caption.** Only what *changes* goes in the prompt.
+  Tags the reference already satisfies must be left out — including the
+  character's name. Identity comes from the image, not the text; naming the
+  character in the prompt is the failure mode the training objective was
+  designed to starve.
+- **Anima tag vocabulary**, comma-separated (`blue eyes`, not `blue_eyes` — the
+  builder nodes normalize this for you).
+- **The rating band participates.** `safe` / `sensitive` / `nsfw` / `explicit`
+  are ordinary tags, so `nsfw, -safe` converts the rating. That is a real
+  capability, and it means an accidental rating tag in your instruction will
+  move the output.
+- **Do not add quality tags** (`masterpiece`, `best quality`) to the
+  instruction. Training saw deltas only; anything else is off-convention.
+  Quality *negatives* on the negative prompt are fine and are what the workflow
+  ships with.
+
+### Building the instruction
+
+Two CPU-only helper nodes ship here so you don't hand-compose the string:
+
+- **`Anima EasyEdit Instruction (add / remove)`** — two text fields, one
+  correctly formatted instruction out. Use this when you know what you want to
+  change.
+- **`Anima EasyEdit Delta (caption diff)`** — two full captions in
+  (`source_caption`, `target_caption`), the delta out. Wire the
+  [Anima Tagger](https://github.com/sorryhyun/anima_lora) node's caption output
+  into `source_caption`, paste an edited copy into `target_caption`, and you get
+  "edit the image by editing its caption" — the DirectEdit UX without the
+  inversion pass. Shared tags cancel automatically, so you cannot accidentally
+  leave the character name in. It also outputs the computed `additions` and
+  `removals` separately, which is the quickest way to see why an edit did
+  something you didn't ask for.
+
+Both emit the same format the training-time pair miner produced (there is a test
+pinning that equivalence), and both accept comma- **or** newline-separated tags.
+
+### Settings
+
+Defaults are the validated operating point — the workflow ships with them:
+
+| | |
+|---|---|
+| `strength` | `1.0` |
+| `target_megapixels` | `1.0` |
+| `cond_scale_override` | `0` (use the trained value) |
+| sampler / scheduler | `euler` / `simple` |
+| steps / cfg | `28` / `4.0` |
+
+ComfyUI's built-in Anima config already uses `shift = 3.0`, which is the shift
+the adapter was validated at, so no extra sampling-shift node is needed.
+
+**There is deliberately no `b_cond` offset knob.** This node applies the
+checkpoint's trained gate verbatim — equivalent to `b_offset 0` in the
+anima_lora CLI — and that *is* EasyEdit's operating point. The engaged band is
+narrow and centered there: raising the gate by +2 pulls the output back toward
+the reference's composition and +3 is a near-verbatim copy of the reference.
+If an edit isn't landing, change the instruction, not the gate.
+
+### Limits (alpha)
+
+The checkpoint is published as `_alpha` for these reasons; know them before you
+file a bug:
+
+- **Removals of objects that are physically present in the reference mostly
+  fail.** `-ramune`, `-inflatable orca`, `-hair beads` largely survive the
+  instruction. Additions and *state changes* ("jacket partially removed") are
+  where the adapter is strong. Negation is adapter-side only — the text encoder
+  reads `-ramune` as "ramune", so a weak adapter response leaves you with an
+  attractor, not a removal. If a removal matters, phrase the change as an
+  addition where you can.
+- **Validation is narrow.** The published evidence is a render-judged
+  instruction probe on three characters at a single seed, drawn from the
+  training pair set — an upper bound, not a held-out score. Off-corpus images
+  (non-anime, or styles the base model covers thinly) are untested.
+- **Composition is not preserved by design.** If you need the original framing
+  and background pixels intact, use DirectEdit, not this.
 
 ## How it works
 
