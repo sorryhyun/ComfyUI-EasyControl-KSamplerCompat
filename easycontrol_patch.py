@@ -30,9 +30,10 @@ Mechanism, per denoising step:
     ``[target_k ; cond_k]`` / ``[target_v ; cond_v]`` with a per-block additive
     logit bias ``b_cond`` on the cond columns (the trained gate). Cross-attn and
     MLP run baseline. This extended attention runs on flash-attn (via an exact
-    LSE decomposition of the joint softmax) when ComfyUI is launched with
-    ``--use-flash-attention`` and ``flash_attn`` is installed; otherwise it uses
-    a portable float-mask SDPA path. See ``_extended_self_attn``.
+    LSE decomposition of the joint softmax) whenever ``flash_attn`` is
+    installed; otherwise it uses a portable mask-free SDPA path that folds the
+    bias into an appended head dimension so the call stays flash-backend
+    eligible. See ``_extended_self_attn``.
 
 Robustness: the per-block forward closures resolve their block from
 ``state.live_blocks`` (refreshed by the pre-hook from the live diffusion_model
@@ -77,11 +78,12 @@ try:  # ComfyUI < 0.24
 except ImportError:  # ComfyUI >= 0.24 — standalone helper removed
     _comfy_apply_rope = None
 
-# Optional flash-attention fast path for the extended self-attention. Mirrors
-# ComfyUI's own gating (comfy/ldm/modules/attention.py): the kernel is used only
-# when (a) ``flash_attn`` imports and (b) the user launched with
-# ``--use-flash-attention`` (surfaced as ``model_management.flash_attention_enabled()``).
-# Otherwise we fall back to the float-mask SDPA path, which works everywhere.
+# Optional flash-attention fast path for the extended self-attention. Used
+# whenever ``flash_attn`` is importable — this is the node's own internal
+# attention choice, independent of ComfyUI's global ``--use-flash-attention``
+# launch flag (which only selects the backend for *comfy's* attention calls).
+# If the kernel errors at runtime (e.g. an unsupported GPU arch), the first
+# failure permanently drops to the SDPA fallback, which works everywhere.
 try:
     from flash_attn import flash_attn_func as _flash_attn_func
 except ImportError:
@@ -91,23 +93,22 @@ _FLASH_ENABLED_CACHE: Optional[bool] = None
 
 
 def _flash_ext_enabled() -> bool:
-    """True iff flash-attn is importable AND ComfyUI was launched with
-    ``--use-flash-attention``. Result cached — the launch flag can't change
-    mid-process."""
+    """True iff flash-attn is importable (and hasn't failed at runtime)."""
     global _FLASH_ENABLED_CACHE
     if _FLASH_ENABLED_CACHE is None:
-        if _flash_attn_func is None:
-            _FLASH_ENABLED_CACHE = False
-        else:
-            try:
-                from comfy import model_management
-
-                _FLASH_ENABLED_CACHE = bool(model_management.flash_attention_enabled())
-            except Exception:
-                _FLASH_ENABLED_CACHE = False
+        _FLASH_ENABLED_CACHE = _flash_attn_func is not None
         if _FLASH_ENABLED_CACHE:
             logger.info("EasyControl: flash-attention extended-attn path enabled.")
     return _FLASH_ENABLED_CACHE
+
+
+def _flash_ext_disable(reason: BaseException) -> None:
+    global _FLASH_ENABLED_CACHE
+    _FLASH_ENABLED_CACHE = False
+    logger.warning(
+        "EasyControl: flash-attn extended-attn failed (%s); using the SDPA "
+        "fallback from now on.", reason,
+    )
 
 
 def apply_rotary_pos_emb(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -493,30 +494,42 @@ def _extended_self_attn(tq, tk, tv, ck, cv, b_cond):
     ``b_cond`` logit bias on the cond columns. All inputs [B, S, H, D] (cond may
     be batch-1 and is broadcast). Returns [B, S, H, D].
 
-    Dispatches to the flash-attn LSE-decomposed path when enabled (see
-    ``_extended_self_attn_flash``); otherwise uses the portable float-mask SDPA
-    path. The float ``attn_mask`` forces SDPA onto its mem-efficient/math
-    backend (flash SDPA can't take arbitrary float masks), so the flash path is
-    a genuine speedup when available."""
+    Dispatches to the flash-attn LSE-decomposed path when the library is
+    available (see ``_extended_self_attn_flash``); otherwise uses a mask-free
+    SDPA formulation: the uniform ``b_cond`` bias is folded into one appended
+    head dimension (query extra = sqrt(D), target-key extra = 0, cond-key extra
+    = b_cond, explicit ``scale=1/sqrt(D)``), so the logit picks up exactly
+    ``+b_cond`` on cond columns with no ``attn_mask``. A float mask would force
+    SDPA off its flash backend onto the much slower mem-efficient kernel
+    (~2.6x at ~1MP shapes); mask-free, the padded call stays flash-eligible.
+    The head dim is zero-padded to a multiple of 8 (flash kernel alignment;
+    zero dims contribute nothing to any dot product) and the padded value
+    channels are sliced off the output."""
     if (
         _flash_ext_enabled()
         and tq.is_cuda
         and tq.dtype in (torch.float16, torch.bfloat16)
     ):
-        return _extended_self_attn_flash(tq, tk, tv, ck, cv, b_cond)
+        try:
+            return _extended_self_attn_flash(tq, tk, tv, ck, cv, b_cond)
+        except Exception as e:  # unsupported arch/head-dim → permanent fallback
+            _flash_ext_disable(e)
 
-    B, S = tq.shape[0], tq.shape[1]
+    B, S, _, D = tq.shape
     if ck.shape[0] != B:
         ck = ck.expand(B, -1, -1, -1)
         cv = cv.expand(B, -1, -1, -1)
-    Sc = ck.shape[1]
-    k = torch.cat([tk, ck], dim=1).transpose(1, 2)  # [B,H,S+Sc,D]
-    v = torch.cat([tv, cv], dim=1).transpose(1, 2)
-    q = tq.transpose(1, 2)
-    mask = torch.zeros(S + Sc, device=q.device, dtype=q.dtype)
-    mask[S:] = b_cond.to(q.dtype)
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.view(1, 1, 1, S + Sc))
-    return out.transpose(1, 2)  # [B,S,H,D]
+    pad = 8 - D % 8 if D % 8 else 8  # >=1 bias dim, total a multiple of 8
+    q = F.pad(tq, (0, pad))
+    q[..., D] = math.sqrt(D)
+    k = F.pad(torch.cat([tk, ck], dim=1), (0, pad))
+    k[:, S:, :, D] = b_cond.to(k.dtype)
+    v = F.pad(torch.cat([tv, cv], dim=1), (0, pad))
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        scale=1.0 / math.sqrt(D),
+    )
+    return out.transpose(1, 2)[..., :D]  # [B,S,H,D]
 
 
 def _extended_self_attn_flash(tq, tk, tv, ck, cv, b_cond):

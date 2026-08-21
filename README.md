@@ -250,10 +250,14 @@ warning — if you hit this, update the node).
   per-block patches resolve their block from the live diffusion_model each
   forward (rebuild-tolerant), but as with the other Anima nodes, mixing
   DiT-rebuilding patches is best avoided.
-- **Attention.** Extended attention uses `scaled_dot_product_attention` with an
-  additive bias mask (memory-efficient backends handle the bias). This differs
-  from anima_lora's training-time flash-LSE path numerically only at the ulp
-  level.
+- **Attention.** Extended attention runs on `flash_attn` (exact LSE
+  decomposition, same as anima_lora's training-time path) whenever the library
+  is installed — no launch flag needed. Without it, a mask-free
+  `scaled_dot_product_attention` formulation is used: the `b_cond` bias is
+  folded into one appended head dimension so the call stays on SDPA's fast
+  flash backend instead of the ~2.6x slower mem-efficient kernel a float
+  `attn_mask` would force. Both paths differ from each other numerically only
+  at the ulp level.
 - **One reference image.** If a batch is fed to `IMAGE`, the first image is used.
 
 ## Relationship to the Anima Adapter Loader
