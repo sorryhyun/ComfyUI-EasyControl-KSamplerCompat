@@ -672,6 +672,7 @@ def _make_prefill_pre_hook(state: EasyControlState):
             _build_cond_kv(module, state, device, dtype)
         return None
 
+    pre_hook._easycontrol_prefill_hook = True
     return pre_hook
 
 
@@ -782,7 +783,11 @@ def install_easycontrol(model, weight_path, cond_latent, strength, cond_scale_ov
     # Lazy-prefill pre-hook on diffusion_model (object-patched OrderedDict so it
     # reverts on unpatch and composes with other pre-hooks).
     pre_hook = _make_prefill_pre_hook(state)
-    new_pre = OrderedDict(diffusion_model._forward_pre_hooks)
+    new_pre = OrderedDict(
+        (key, hook)
+        for key, hook in diffusion_model._forward_pre_hooks.items()
+        if not getattr(hook, "_easycontrol_prefill_hook", False)
+    )
     new_pre[id(pre_hook)] = pre_hook
     model.add_object_patch("diffusion_model._forward_pre_hooks", new_pre)
 
